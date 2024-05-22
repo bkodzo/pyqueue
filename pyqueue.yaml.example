@@ -1,0 +1,46 @@
+broker:
+  host: "0.0.0.0"
+  port: 5555
+  visibility_timeout: 10
+  max_retries: 3
+  journal_file: "journal.log"
+
+security:
+  enabled: false
+  api_key: null
+  jwt_secret: null
+  tls_enabled: false
+  tls_cert_file: null
+  tls_key_file: null
+  permissions:
+    api_key_user:
+      - "*"
+    user1:
+      - "queue1"
+      - "queue2"
+
+queues:
+  default_max_depth: 10000
+  default_ttl: null
+  enable_backpressure: true
+
+compression:
+  enabled: true
+  algorithm: "gzip"
+  min_size_bytes: 1024
+
+monitoring:
+  prometheus_enabled: true
+  prometheus_port: 9090
+  metrics_interval: 10
+
+raft:
+  election_timeout: 5.0
+  heartbeat_interval: 2.0
+  snapshot_interval: 3600
+  snapshot_threshold: 1000
+
+rate_limiting:
+  default_rate: 10.0
+  default_burst: 20
+

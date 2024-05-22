@@ -1,0 +1,71 @@
+services:
+  broker:
+    build: .
+    container_name: pyqueue-broker
+    ports:
+      - "5555:5555"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BROKER_HOST=0.0.0.0
+      - BROKER_PORT=5555
+      - JOURNAL_FILE=/app/data/journal.log
+    command: python run_broker.py
+    restart: unless-stopped
+    networks:
+      - pyqueue-network
+
+  api:
+    build: .
+    container_name: pyqueue-api
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BROKER_HOST=broker
+      - BROKER_PORT=5555
+      - API_PORT=8080
+      - JOURNAL_FILE=/app/data/journal.log
+    command: python run_api.py
+    depends_on:
+      - broker
+    restart: unless-stopped
+    networks:
+      - pyqueue-network
+
+  worker:
+    build: .
+    depends_on:
+      - broker
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BROKER_HOST=broker
+      - BROKER_PORT=5555
+    command: python run_worker.py
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+    networks:
+      - pyqueue-network
+
+  producer:
+    build: .
+    depends_on:
+      - broker
+    environment:
+      - PYTHONUNBUFFERED=1
+      - BROKER_HOST=broker
+      - BROKER_PORT=5555
+    command: python run_producer.py "sample_task"
+    restart: "no"
+    profiles:
+      - tools
+    networks:
+      - pyqueue-network
+
+networks:
+  pyqueue-network:
+    driver: bridge
