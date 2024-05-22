@@ -61,12 +61,13 @@ The broker is the central nervous system of PyQueue. It maintains several critic
 
 **Worker Registry**: Tracks active workers and their last heartbeat timestamp to detect dead workers.
 
-The broker operates as a multi-threaded server. The main thread accepts TCP connections and spawns worker threads for each client. Background threads handle:
-- **Reaper Thread**: Monitors the processing queue and moves expired tasks back to ready queues
-- **Scheduler Thread**: Processes scheduled tasks
-- **Heartbeat Thread**: Detects and removes dead workers
-- **Metrics Thread**: Periodically logs system statistics
-- **TTL Cleanup Thread**: Removes expired tasks based on time-to-live settings
+The broker operates as an async server using Python's `asyncio` framework. The main event loop accepts TCP connections and handles each client asynchronously. Background async tasks handle:
+- **Reaper Task**: Monitors the processing queue and moves expired tasks back to ready queues
+- **Scheduler Task**: Processes scheduled tasks
+- **Heartbeat Task**: Detects and removes dead workers
+- **Metrics Task**: Periodically logs system statistics
+- **TTL Cleanup Task**: Removes expired tasks based on time-to-live settings
+- **Transaction Cleanup Task**: Expires and cleans up timed-out transactions
 
 #### 3. Worker (Consumer)
 Workers are the execution engines of the system. They continuously poll the broker for tasks, process them, and send acknowledgment (ACK) or negative acknowledgment (NACK) back to the broker. Workers are designed to be stateless and horizontally scalable - you can run as many workers as needed to handle the workload.
@@ -87,10 +88,10 @@ Workers can specify which queue to pull from, enabling workload partitioning. Fo
 
 ### Custom Application-Layer Protocol
 
-PyQueue implements a custom binary protocol over TCP. This design choice provides several advantages over HTTP/REST:
+PyQueue implements a custom text-based protocol over TCP. This design choice provides several advantages over HTTP/REST:
 - Lower overhead (no HTTP headers)
 - Persistent connections (connection pooling)
-- Binary encoding (more efficient than JSON for large payloads)
+- Simple, human-readable format for debugging
 - Full control over message framing
 
 ### Message Format
@@ -100,11 +101,14 @@ Every message follows a strict format:
 <COMMAND> <LENGTH> <PAYLOAD>
 ```
 
-- **COMMAND**: Fixed-width string (e.g., "PUSH", "PULL", "ACK")
-- **LENGTH**: 4-byte integer (network byte order) indicating payload size
+- **COMMAND**: ASCII string (e.g., "PUSH", "PULL", "ACK")
+- **LENGTH**: Decimal integer (ASCII) indicating payload size in bytes
 - **PAYLOAD**: Variable-length binary data (typically JSON-encoded)
 
 ### Protocol Commands
+
+**Authentication:**
+- `AUTH`: Authenticate with API key or JWT token (required before other commands if security enabled)
 
 **Producer Commands:**
 - `PUSH`: Submit a single task
@@ -187,21 +191,22 @@ Applications must be designed to handle idempotency - processing the same task m
 
 #### Journal-Based Persistence
 
-To survive broker crashes, all state-changing operations are written to an append-only journal file:
+To survive broker crashes, all state-changing operations are written to an append-only journal file in JSON lines format:
 
-```
-PUSH <timestamp> <task_id> <payload>
-ACK <timestamp> <task_id>
-SCHEDULE <timestamp> <task_id> <scheduled_at> <payload>
-PUBLISH <timestamp> <topic> <task_id> <queue> <message>
+```json
+{"command": "PUSH", "timestamp": 1234567890.0, "data": {"task_id": "...", "payload": "...", ...}}
+{"command": "ACK", "timestamp": 1234567891.0, "data": {"task_id": "..."}}
+{"command": "SCHEDULE", "timestamp": 1234567892.0, "data": {"task_id": "...", "schedule": "...", ...}}
+{"command": "PUBLISH", "timestamp": 1234567893.0, "data": {"topic": "...", "message": "...", ...}}
 ```
 
 On broker startup, the journal is replayed:
 1. All PUSH entries are restored to ready queues
 2. ACK entries are used to filter out already-completed tasks
 3. SCHEDULE entries are restored to the scheduled tasks list
+4. Only entries up to the persisted commit index are applied (for Raft clusters)
 
-This ensures that even if the broker crashes, tasks are not lost. The journal is written synchronously (with flushing) to ensure durability.
+This ensures that even if the broker crashes, tasks are not lost. The journal is written asynchronously using `run_in_executor` for blocking I/O, with periodic flushing to ensure durability.
 
 #### Dead Letter Queue (DLQ)
 
@@ -332,17 +337,19 @@ This ensures at most one leader per term and prevents split-brain scenarios.
 
 When the leader receives a write operation (PUSH, ACK, SCHEDULE, PUBLISH):
 1. It appends the operation to its local log
-2. Sends AppendEntries RPCs to all followers
-3. Waits for majority acknowledgment
-4. Commits the entry (applies to state machine)
+2. Sends AppendEntries RPCs to all followers asynchronously using `asyncio.open_connection()`
+3. Waits for majority acknowledgment (async await)
+4. Commits the entry (applies to state machine via callback)
 5. Notifies followers of the commit index
+6. Persists commit index to `raft_state.json` for crash recovery
 
 Followers:
-1. Receive AppendEntries RPC
+1. Receive AppendEntries RPC asynchronously
 2. Check log consistency (previous entry matches)
 3. Append new entries or truncate conflicting entries
 4. Update commit index when leader commits
-5. Apply committed entries to their state machine
+5. Apply committed entries to their state machine via callback
+6. Persist commit index to `raft_state.json`
 
 #### Log Consistency
 
@@ -384,29 +391,32 @@ Each node knows about all other nodes and can communicate with them for consensu
 
 ### Authentication
 
-PyQueue supports two authentication methods:
+PyQueue supports two authentication methods via the `AUTH` command:
 
 #### API Key Authentication
 - Simple shared secret model
-- Client sends: `ApiKey <key>`
+- Client sends: `AUTH` command with JSON payload `{"type": "apikey", "value": "<key>"}`
 - Server validates using constant-time comparison (`hmac.compare_digest`)
 - Prevents timing attacks
 - Returns principal: `"api_key_user"`
 
 #### JWT Token Authentication
 - Token-based authentication with expiration
-- Client sends: `Bearer <token>`
+- Client sends: `AUTH` command with JSON payload `{"type": "jwt", "value": "<token>"}`
 - Server validates signature and expiration
 - Token contains principal and metadata
 - More flexible for multi-user scenarios
 
+Authentication is required before processing other commands when security is enabled. The broker maintains an authenticated session per connection.
+
 ### Authorization
 
 After authentication, authorization checks queue access:
-- Permissions are configured per principal
+- Permissions are configured per principal in the configuration file
 - Supports wildcard patterns (`*` for all queues, `queue*` for prefix matching)
-- Each operation (PUSH, PULL, etc.) can be authorized separately
-- Currently implemented but not enforced in all handlers
+- Each operation (PUSH, PULL, SUBSCRIBE, PUBLISH, ADMIN, etc.) can be authorized separately
+- Authorization is enforced for all operations via `_check_authorization_async()`
+- Unauthorized operations return an error response
 
 ### Configuration
 
@@ -437,17 +447,19 @@ For high-throughput scenarios, batch operations are supported:
 
 ### Async Journal Writes
 
-While journal writes are synchronous for durability, the system batches multiple operations when possible:
-- Multiple operations can be written in a single journal entry
-- Reduces I/O overhead
-- Maintains durability guarantees
+Journal writes are performed asynchronously using `asyncio.run_in_executor()` to avoid blocking the event loop:
+- Blocking I/O operations run in a thread pool executor
+- Journal entries are written in JSON lines format
+- Periodic flushing ensures durability
+- Batch writes reduce I/O overhead when possible
 
 ### Efficient Data Structures
 
 - Priority queues use binary heaps (O(log n) insert, O(1) peek)
 - Processing queue uses hash maps (O(1) lookup)
 - Worker registry uses hash maps for fast updates
-- All critical sections are protected by locks to prevent race conditions
+- All critical sections are protected by `asyncio.Lock()` to prevent race conditions
+- Per-queue locks allow concurrent operations on different queues
 
 ---
 
@@ -484,56 +496,62 @@ While journal writes are synchronous for durability, the system batches multiple
 
 ### Visibility Timeout Recovery
 
-1. **Reaper thread** wakes up every second
-2. Checks all tasks in processing queue
-3. Finds tasks where `expires_at < current_time`
-4. Moves expired tasks back to ready queue
-5. Clears `expires_at` timestamp
-6. Logs the expiration event
+1. **Reaper async task** wakes up every second (`await asyncio.sleep(1)`)
+2. Acquires queue lock asynchronously (`async with self.queue_lock`)
+3. Checks all tasks in processing queue
+4. Finds tasks where `expires_at < current_time`
+5. Moves expired tasks back to ready queue
+6. Clears `expires_at` timestamp
+7. Logs the expiration event
+8. Updates metrics asynchronously
 
 ### Scheduled Task Execution
 
 1. **Producer** sends `SCHEDULE` command with schedule expression
 2. **Broker** parses schedule and calculates next run time
-3. **Broker** adds task to scheduled tasks list
-4. **Scheduler thread** wakes up every second
-5. Checks scheduled tasks for due items
-6. Moves due tasks to ready queues
-7. For recurring tasks, calculates next run time and reschedules
+3. **Broker** adds task to scheduled tasks list (with Raft replication if clustered)
+4. **Scheduler async task** wakes up every second (`await asyncio.sleep(1)`)
+5. Acquires queue lock asynchronously
+6. Checks scheduled tasks for due items
+7. Moves due tasks to ready queues
+8. For recurring tasks, calculates next run time and reschedules
 
 ---
 
 ## Component Interactions
 
-### Threading Model
+### Async Architecture
 
-The broker uses a multi-threaded architecture:
+The broker uses a fully async architecture based on Python's `asyncio`:
 
-**Main Thread**: Accepts connections and spawns client handler threads
+**Main Event Loop**: Manages all I/O operations and async tasks
 
-**Client Handler Threads**: One per connected client, handles all commands from that client
+**Client Handlers**: Each client connection is handled by `_handle_client_async()`, which processes commands asynchronously
 
-**Background Threads**:
+**Background Async Tasks** (created with `asyncio.create_task()`):
 - Reaper: Monitors visibility timeouts
 - Scheduler: Processes scheduled tasks
 - Heartbeat: Detects dead workers
 - Metrics: Logs statistics
 - TTL Cleanup: Removes expired tasks
-- Raft Election: Handles leader election (if clustered)
-- Raft Heartbeat: Sends heartbeats to followers (if leader)
-- Raft Replication: Replicates log entries (if leader)
+- Transaction Cleanup: Expires timed-out transactions
+- Raft Election: Handles leader election (if clustered, fully async)
+- Raft Heartbeat: Sends heartbeats to followers (if leader, fully async)
+- Raft Replication: Replicates log entries (if leader, fully async)
 
-All shared data structures are protected by locks to ensure thread safety.
+All shared data structures are protected by `asyncio.Lock()` to ensure thread safety in the async context.
 
 ### Locking Strategy
 
 - **queue_lock**: Protects all queue operations (ready queues, processing queue, scheduled tasks)
-- **journal_lock**: Protects journal file writes
-- **transaction_lock**: Protects transaction state
-- **vote_lock**: Protects Raft vote counting
-- **log_lock**: Protects Raft log operations
+- **journal_lock**: Protects journal file writes (async lock)
+- **transaction_lock**: Protects transaction state (async lock)
+- **connection_lock**: Protects active connection tracking
+- **queue_locks**: Per-queue locks for concurrent operations on different queues
+- **vote_lock**: Protects Raft vote counting (async lock in Raft module)
+- **log_lock**: Protects Raft log operations (async lock in Raft module)
 
-Locks are held for minimal time to maximize concurrency.
+Locks are held for minimal time using `async with` to maximize concurrency. Per-queue locks allow operations on different queues to proceed in parallel.
 
 ### Error Handling
 
